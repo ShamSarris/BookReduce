@@ -1,0 +1,44 @@
+{
+  "books": [
+    {
+      "name": "Alice in Wonderland",
+      "url": "https://www.gutenberg.org/files/11/11-0.txt"
+    },
+    {
+      "name": "Pride and Prejudice",
+      "url": "https://www.gutenberg.org/files/1342/1342-0.txt"
+    },
+    {
+      "name": "Moby Dick",
+      "url": "https://www.gutenberg.org/files/2701/2701-0.txt"
+    },
+    {
+      "name": "Frankenstein",
+      "url": "https://www.gutenberg.org/files/84/84-0.txt"
+    },
+    {
+      "name": "Dracula",
+      "url": "https://www.gutenberg.org/files/345/345-0.txt"
+    },
+    {
+      "name": "Sherlock Holmes",
+      "url": "https://www.gutenberg.org/files/1661/1661-0.txt"
+    },
+    {
+      "name": "Tale of Two Cities",
+      "url": "https://www.gutenberg.org/files/98/98-0.txt"
+    },
+    {
+      "name": "Dorian Gray",
+      "url": "https://www.gutenberg.org/files/174/174-0.txt"
+    },
+    {
+      "name": "Great Gatsby",
+      "url": "https://www.gutenberg.org/files/64317/64317-0.txt"
+    },
+    {
+      "name": "Wuthering Heights",
+      "url": "https://www.gutenberg.org/files/768/768-0.txt"
+    }
+  ]
+}

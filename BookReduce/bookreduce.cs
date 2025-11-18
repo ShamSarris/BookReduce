@@ -1,277 +1,334 @@
 using System.Net;
-using System.Numerics;
-using System.Security.AccessControl;
-using System.Security.Policy;
+using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
-using System.Web;
+using System.Text.RegularExpressions;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
-using static System.Reflection.Metadata.BlobBuilder;
-using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
+using Azure.Storage.Blobs;
 
 namespace BookReduce;
 
-/// <summary>
-///  Map Reduce pattern for counting word frequencies in book sections using Azure Durable Functions.
-/// </summary>
-public static class BookReduce
+public class BookReduceFunctions
 {
-    /// <summary>
-    /// Input class for orchestration, can expand to list of books and URIs for blob storage implementation
-    /// </summary>
-    public class OrchestrationInput 
+    private readonly ILogger<BookReduceFunctions> _logger;
+
+    public BookReduceFunctions(ILogger<BookReduceFunctions> logger)
     {
-        public string Path { get; set; } = string.Empty;
+        _logger = logger;
     }
 
-    /// <summary>
-    /// Output class for mapped books. Each object contains the book name and section of that book. Then a dictionary that maps words in that section to their frequency count.
-    /// </summary>
-    public class SectionOutput 
+    public class OrchestrationInput 
     {
-        public string Book { get; set; } = string.Empty;
-        public int Section { get; set; } 
-        public Dictionary<string, int> Frequencies { get; set; } = new Dictionary<string, int>(); // word => word count
+        public List<BookInput> Books { get; set; } = new List<BookInput>();
+    }
 
-        public SectionOutput(string book, int section)
+    public class BookInput
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Url { get; set; } = string.Empty;
+    }
+
+    public class BucketOutput 
+    {
+        public string BookName { get; set; } = string.Empty;
+        public int BucketNumber { get; set; } 
+        public Dictionary<string, int> Frequencies { get; set; }
+
+        public BucketOutput(string bookName, int bucketNumber)
         {
             Frequencies = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            Book = book;
-            Section = section;
+            BookName = bookName;
+            BucketNumber = bucketNumber;
         }
     }
 
-    /// <summary>
-    /// Class to reduce the mapped results into a single word occurrence object. Rather than a section with many words, this class represents a single occurence of a word in a book section (with frequency).
-    /// </summary>
-    public class WordOccurence
+    public class TermOccurrence
     {
-        public string Book { get; set; } = string.Empty;
-        public string Section { get; set; } = string.Empty;
-        public int Count { get; set; }
+        public string BookName { get; set; } = string.Empty;
+        public int BucketNumber { get; set; }
+        public int TermFrequency { get; set; }
     }
 
-    /// <summary>
-    /// Starts a new orchestration instance of the <see cref="BookReduce"/> function. Takes HTTP POST requests with file location.
-    /// </summary>
-    /// <param name="req">Contains the POST request information with data path</param>
-    /// <param name="client"></param>
-    /// <param name="executionContext"></param>
-    /// <returns>Status of orchestration w/ output</returns>
-    [Function("BookReduce_HttpStart")]
-    public static async Task<HttpResponseData> HttpStart(
-        [HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req,
-        [DurableClient] DurableTaskClient client,
-        FunctionContext executionContext)
+    public class SaveIndexResult
     {
-        ILogger logger = executionContext.GetLogger("BookReduce_HttpStart");
+        public string BlobName { get; set; } = string.Empty;
+        public int TermCount { get; set; }
+        public int TotalOccurrences { get; set; }
+    }
 
-        // TODO: Change to blob storage for prod, for now use .txts locally !!!
-        var path = "C:\\Users\\HamSa\\csClasses\\CS722\\2P_Real\\BookReduce\\BookReduce\\books\\"; // Local path for testing
+    private static readonly HashSet<string> StopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "a", "an", "the", "or", "and", "but", "with"
+    };
 
-        // Function input comes from the request content.
+    [Function("BookReduce_HttpStart")]
+    public async Task<HttpResponseData> HttpStart(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req,
+        [DurableClient] DurableTaskClient client)
+    {
+        OrchestrationInput? input;
+        try
+        {
+            input = await req.ReadFromJsonAsync<OrchestrationInput>();
+            if (input == null || input.Books == null || input.Books.Count == 0)
+            {
+                throw new Exception("No books provided");
+            }
+        }
+        catch
+        {
+            input = new OrchestrationInput
+            {
+                Books = new List<BookInput>
+                {
+                    new BookInput { Name = "Alice in Wonderland", Url = "https://www.gutenberg.org/files/11/11-0.txt" },
+                    new BookInput { Name = "Pride and Prejudice", Url = "https://www.gutenberg.org/files/1342/1342-0.txt" },
+                    new BookInput { Name = "Moby Dick", Url = "https://www.gutenberg.org/files/2701/2701-0.txt" },
+                    new BookInput { Name = "Frankenstein", Url = "https://www.gutenberg.org/files/84/84-0.txt" },
+                    new BookInput { Name = "Dracula", Url = "https://www.gutenberg.org/files/345/345-0.txt" },
+                    new BookInput { Name = "Sherlock Holmes", Url = "https://www.gutenberg.org/files/1661/1661-0.txt" },
+                    new BookInput { Name = "Tale of Two Cities", Url = "https://www.gutenberg.org/files/98/98-0.txt" },
+                    new BookInput { Name = "Dorian Gray", Url = "https://www.gutenberg.org/files/174/174-0.txt" },
+                    new BookInput { Name = "Great Gatsby", Url = "https://www.gutenberg.org/files/64317/64317-0.txt" },
+                    new BookInput { Name = "Wuthering Heights", Url = "https://www.gutenberg.org/files/768/768-0.txt" }
+                }
+            };
+        }
+
         string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
-            nameof(BookReduce), new OrchestrationInput {Path = path});
+            "BookReduce", input);
 
-        logger.LogInformation("Started orchestration with ID = '{instanceId}'.", instanceId);
-
-        // Returns an HTTP 202 response with an instance management payload.
-        // See https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-http-api#start-orchestration
+        _logger.LogInformation("Started orchestration with ID = '{instanceId}' for {bookCount} books", 
+            instanceId, input.Books.Count);
 
         return await client.CreateCheckStatusResponseAsync(req, instanceId);
     }
 
-    /// <summary>
-    /// Orchestrates the MapReduce pattern for all the given book paths.
-    /// Calls the mapper function for each file found, then calls the reducer function to aggregate results
-    /// </summary>
-    /// <param name="context"></param>
-    /// <returns>Output of where resulting JSON file can be found and a summary of the mapping procedure</returns>
-    [Function(nameof(BookReduce))]
-    public static async Task<List<string>> RunOrchestrator(
+    [Function("BookReduce")]
+    public async Task<string> RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
     {
-        ILogger logger = context.CreateReplaySafeLogger(nameof(BookReduce));
+        ILogger logger = context.CreateReplaySafeLogger("BookReduce");
 
-        // Get Files to process
         var input = context.GetInput<OrchestrationInput>();
-        string path = input.Path;
+        
+        logger.LogInformation("Starting MapReduce for {bookCount} books", input!.Books.Count);
+        context.SetCustomStatus($"Starting MapReduce for {input.Books.Count} books...");
 
-        var files = await context.CallActivityAsync<string[]>
-            (nameof(GetFileListAsync), path);
-
-        var outputs = new List<string>();
-
-        logger.LogInformation("Files found: {fileCount}", files.Length);
-        logger.LogInformation("Creating mappers to process files...");
-        context.SetCustomStatus($"Files found: {files.Length}. Creating mappers to process files...");
-
-        // Create mappers to process each file
-        var tasks = new Task<SectionOutput[]>[files.Length];
-        for (int i = 0; i < files.Length; i++)
+        // MAP PHASE: Fan-out
+        var mapTasks = new List<Task<BucketOutput[]>>();
+        foreach (var book in input.Books)
         {
-            tasks[i] = context.CallActivityAsync<SectionOutput[]>(
-                nameof(MapperAsync),
-                files[i]);
+            mapTasks.Add(context.CallActivityAsync<BucketOutput[]>(
+                "MapWorker",
+                book));
         }
 
-        // Wait for all mapper tasks to complete
-        var results = await Task.WhenAll(tasks); 
-        var flatResults = results.SelectMany(sections => sections).ToArray();
+        logger.LogInformation("Map phase: Processing {mapperCount} books in parallel", mapTasks.Count);
+        context.SetCustomStatus($"Map phase: Processing {mapTasks.Count} books...");
 
-        // Reduce mapper results
-        var reducedPath = await context.CallActivityAsync<string>(
-            nameof(Reducer),
-            flatResults);
+        var mapResults = await Task.WhenAll(mapTasks);
+        var allBuckets = mapResults.SelectMany(buckets => buckets).ToArray();
 
-        // Process results
-        foreach (var section in flatResults)
-        {
-            outputs.Add($"Book: {section.Book}, Section: {section.Section}, Unique Words: {section.Frequencies.Count}");
-        }
-        outputs.Add($"Reduced Results located at: {reducedPath}");
+        logger.LogInformation("Map complete: {bucketCount} buckets generated", allBuckets.Length);
+        context.SetCustomStatus($"Map complete. Reducing {allBuckets.Length} buckets...");
 
-        return outputs;
+        // REDUCE & SAVE PHASE - Combined to avoid passing huge data between activities
+        var result = await context.CallActivityAsync<SaveIndexResult>(
+            "ReduceAndSaveWorker",
+            allBuckets);
+
+        logger.LogInformation("MapReduce complete: {blobName}", result.BlobName);
+        
+        return $"SUCCESS: {result.BlobName} ({result.TermCount} terms, {result.TotalOccurrences} occurrences)";
     }
 
-    /// <summary>
-    /// Reduces the outputs of map which has many words per section into a single object per word with all occurrences across sections and books.
-    /// </summary>
-    /// <param name="sections">The results from mapping</param>
-    /// <param name="executionContext"></param>
-    /// <returns>The path to the resulting JSON file with reduced results</returns>
-    [Function(nameof(Reducer))]
-    public static async Task<string> Reducer([ActivityTrigger] SectionOutput[] sections, FunctionContext executionContext)
+    [Function("MapWorker")]
+    public async Task<BucketOutput[]> MapWorker(
+        [ActivityTrigger] BookInput bookInput)
     {
-        ILogger logger = executionContext.GetLogger("Reducer");
-        logger.LogInformation("Reducing {sectionCount} sections.", sections.Length);
+        _logger.LogInformation("MAP: Processing '{bookName}'", bookInput.Name);
 
-        var reducedResults = new Dictionary<string, List<WordOccurence>>();
-
-        foreach (var section in sections)
-        {
-            foreach (var kvp in section.Frequencies)
-            {
-                var word = kvp.Key;
-                var count = kvp.Value;
-                if (!reducedResults.ContainsKey(word))
-                {
-                    reducedResults[word] = new List<WordOccurence>();
-                }
-                reducedResults[word].Add(new WordOccurence
-                {
-                    Book = section.Book,
-                    Section = section.Section.ToString(),
-                    Count = count
-                });
-            }
-        }
-
-        var jsonOptions = new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-        };
-
-        string jsonContent = JsonSerializer.Serialize(reducedResults, jsonOptions);
-
-        string outputPath = Path.Combine(
-            "C:\\Users\\HamSa\\csClasses\\CS722\\2P_Real\\BookReduce\\BookReduce",
-            "reduced_results.json");
+        var buckets = new List<BucketOutput>();
 
         try
         {
-            await File.WriteAllTextAsync(outputPath, jsonContent);
-            return $"Reduced results written to {outputPath}";
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Error writing reduced results to file.");
-            return $"Error writing reduced results: {ex.Message}";
-        }
-    }
+            using var httpClient = new HttpClient();
+            httpClient.Timeout = TimeSpan.FromMinutes(2);
+            string content = await httpClient.GetStringAsync(bookInput.Url);
 
-    /// <summary>
-    /// Set of words to ignore when parsing and counting word frequencies.
-    /// </summary>
-    private static readonly HashSet<string> StopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "a", "an", "the", "or", "and", "but", "with", "in", "on", "at", "to", "for", "of", "as", "by", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "this", "that", "these", "those", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "her", "its", "our", "their", "not", "no", "yes"
-    };
-
-    /// <summary>
-    /// Mapper function takes a file path, reads the file, splits into sections, and counts word frequencies in each section.
-    /// Creates section objects of 5000 words each which are returned together as an array.
-    /// </summary>
-    [Function(nameof(MapperAsync))]
-    public static async Task<SectionOutput[]> MapperAsync(
-        [ActivityTrigger] string filePath, FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger("MapperAsync");
-        logger.LogInformation("Processing file: {filePath}", filePath);
-
-        var sections = Array.Empty<SectionOutput>();
-
-        try
-        {
-            string content = await File.ReadAllTextAsync(filePath);
-
-            var words = content.Split(new char[] { ' ', '\n', '\r', ',', '.', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
-
-            var total = 0;
+            // Remove punctuation
+            string cleanedContent = Regex.Replace(content, @"[^\w\s]", " ");
             
-            var curr = new SectionOutput(Path.GetFileName(filePath), 0);
-            sections.Append(curr);
+            var words = cleanedContent
+                .Split(new char[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(w => w.Trim().ToLower())
+                .Where(w => !string.IsNullOrWhiteSpace(w))
+                .ToArray();
+
+            _logger.LogInformation("MAP: '{bookName}' has {wordCount} words", bookInput.Name, words.Length);
+
+            const int BUCKET_SIZE = 5000;
+            int bucketNumber = 1;
+            BucketOutput currentBucket = new BucketOutput(bookInput.Name, bucketNumber);
+            int wordCount = 0;
+
             foreach (var word in words)
             {
-                if (total % 5000 == 0) // New section every 5000 words
+                if (StopWords.Contains(word))
+                    continue;
+
+                if (currentBucket.Frequencies.ContainsKey(word))
                 {
-                    Array.Resize(ref sections, sections.Length + 1);
-                    curr = new SectionOutput(Path.GetFileName(filePath), sections.Length - 1);
-                    sections[^1] = curr;
+                    currentBucket.Frequencies[word]++;
+                }
+                else
+                {
+                    currentBucket.Frequencies[word] = 1;
                 }
 
-                // Skip common words (stop words)
-                if (!StopWords.Contains(word))
-                {
-                    if (curr.Frequencies.ContainsKey(word))
-                    {
-                        curr.Frequencies[word]++;
-                    }
-                    else
-                    {
-                        curr.Frequencies[word] = 1;
-                    }
-                }
+                wordCount++;
 
-                total++;
+                if (wordCount % BUCKET_SIZE == 0)
+                {
+                    buckets.Add(currentBucket);
+                    bucketNumber++;
+                    currentBucket = new BucketOutput(bookInput.Name, bucketNumber);
+                }
             }
+
+            if (currentBucket.Frequencies.Count > 0)
+            {
+                buckets.Add(currentBucket);
+            }
+
+            _logger.LogInformation("MAP: '{bookName}' → {bucketCount} buckets", bookInput.Name, buckets.Count);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error processing file: {filePath}", filePath);
+            _logger.LogError(ex, "MAP ERROR: Failed to process '{bookName}'", bookInput.Name);
         }
 
-        return sections;
+        return buckets.ToArray();
     }
 
-    /// <summary>
-    ///    Currently gets list of .txt files from local directory asynchronously for testing. TODO: Change to blob storage for production. !!!
-    /// </summary>
-    /// <param name="path">Local path to book files</param>
-    /// <param name="executionContext"></param>
-    /// <returns>.txt files found at path</returns>
-    [Function(nameof(GetFileListAsync))]
-    public static async Task<string[]> GetFileListAsync([ActivityTrigger] string path, FunctionContext executionContext)
+    [Function("ReduceAndSaveWorker")]
+    public async Task<SaveIndexResult> ReduceAndSaveWorker(
+        [ActivityTrigger] BucketOutput[] buckets)
     {
-        ILogger logger = executionContext.GetLogger("GetFileListAsync");
-        logger.LogInformation("Getting file list from path: {path}", path);
-        // For local testing, get .txt files from the specified directory asynchronously
-        var files = await Task.Run(() => Directory.GetFiles(path, "*.txt"));
-        return files;
+        _logger.LogInformation("REDUCE & SAVE: Processing {bucketCount} buckets", buckets.Length);
+
+        try
+        {
+            string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage") 
+                ?? throw new Exception("AzureWebJobsStorage not configured");
+            
+            var blobServiceClient = new BlobServiceClient(connectionString);
+            var containerClient = blobServiceClient.GetBlobContainerClient("mapreduce-output");
+            await containerClient.CreateIfNotExistsAsync();
+            
+            string blobName = $"inverted_index_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json";
+            var blobClient = containerClient.GetBlobClient(blobName);
+
+            // Build inverted index
+            var invertedIndex = new Dictionary<string, List<TermOccurrence>>(StringComparer.OrdinalIgnoreCase);
+            
+            foreach (var bucket in buckets)
+            {
+                foreach (var kvp in bucket.Frequencies)
+                {
+                    string term = kvp.Key;
+                    int frequency = kvp.Value;
+
+                    if (!invertedIndex.ContainsKey(term))
+                    {
+                        invertedIndex[term] = new List<TermOccurrence>();
+                    }
+
+                    invertedIndex[term].Add(new TermOccurrence
+                    {
+                        BookName = bucket.BookName,
+                        BucketNumber = bucket.BucketNumber,
+                        TermFrequency = frequency
+                    });
+                }
+            }
+
+            // Sort each term's occurrences
+            foreach (var term in invertedIndex.Keys.ToList())
+            {
+                invertedIndex[term] = invertedIndex[term]
+                    .OrderByDescending(occ => occ.TermFrequency)
+                    .ThenBy(occ => occ.BookName)
+                    .ThenBy(occ => occ.BucketNumber)
+                    .ToList();
+            }
+
+            _logger.LogInformation("REDUCE: Index with {termCount} terms created", invertedIndex.Count);
+
+            // Calculate statistics
+            int totalTerms = invertedIndex.Count;
+            int totalOccurrences = invertedIndex.Values.Sum(list => list.Count);
+            var topTerms = invertedIndex
+                .Select(kvp => new { 
+                    Term = kvp.Key, 
+                    TotalFreq = kvp.Value.Sum(o => o.TermFrequency)
+                })
+                .OrderByDescending(x => x.TotalFreq)
+                .Take(10)
+                .ToList();
+
+            // Stream JSON directly to blob to avoid memory issues
+            using var stream = new MemoryStream();
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+
+            writer.WriteStartObject();
+            foreach (var kvp in invertedIndex.OrderBy(x => x.Key))
+            {
+                writer.WritePropertyName(kvp.Key);
+                writer.WriteStartArray();
+                foreach (var occ in kvp.Value)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("bookName", occ.BookName);
+                    writer.WriteNumber("bucketNumber", occ.BucketNumber);
+                    writer.WriteNumber("termFrequency", occ.TermFrequency);
+                    writer.WriteEndObject();
+                }
+                writer.WriteEndArray();
+            }
+            writer.WriteEndObject();
+            await writer.FlushAsync();
+
+            // Upload to blob
+            stream.Position = 0;
+            await blobClient.UploadAsync(stream, overwrite: true);
+
+            _logger.LogInformation("=== INDEX STATISTICS ===");
+            _logger.LogInformation("Total terms: {terms}", totalTerms);
+            _logger.LogInformation("Total occurrences: {occ}", totalOccurrences);
+            _logger.LogInformation("Top 10 terms:");
+            foreach (var t in topTerms)
+            {
+                _logger.LogInformation("  {term}: {freq}", t.Term, t.TotalFreq);
+            }
+            _logger.LogInformation("Saved to blob: {blobName}", blobName);
+            _logger.LogInformation("Download from: Azure Portal → bookreducestorage → mapreduce-output → {blobName}", blobName);
+
+            return new SaveIndexResult
+            {
+                BlobName = blobName,
+                TermCount = totalTerms,
+                TotalOccurrences = totalOccurrences
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Reduce and Save failed");
+            throw;
+        }
     }
 }
