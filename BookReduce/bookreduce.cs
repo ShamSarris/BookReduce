@@ -20,12 +20,22 @@ namespace BookReduce;
 /// </summary>
 public static class BookReduce
 {
+
     /// <summary>
-    /// Input class for orchestration, can expand to list of books and URIs for blob storage implementation
+    /// Input class for orchestration with book title and URL pairs
     /// </summary>
     public class OrchestrationInput 
     {
-        public string Path { get; set; } = string.Empty;
+        public List<BookInput> Books { get; set; } = new List<BookInput>();
+    }
+
+    /// <summary>
+    /// Represents a book with its title and URL
+    /// </summary>
+    public class BookInput
+    {
+        public string Title { get; set; } = string.Empty;
+        public string Url { get; set; } = string.Empty;
     }
 
     /// <summary>
@@ -35,7 +45,7 @@ public static class BookReduce
     {
         public string Book { get; set; } = string.Empty;
         public int Section { get; set; } 
-        public Dictionary<string, int> Frequencies { get; set; } = new Dictionary<string, int>(); // word => word count
+        public Dictionary<string, int> Frequencies { get; set; } // word => word count
 
         public SectionOutput(string book, int section)
         {
@@ -56,9 +66,9 @@ public static class BookReduce
     }
 
     /// <summary>
-    /// Starts a new orchestration instance of the <see cref="BookReduce"/> function. Takes HTTP POST requests with file location.
+    /// Starts a new orchestration instance of the <see cref="BookReduce"/> function. Takes HTTP POST requests with book list.
     /// </summary>
-    /// <param name="req">Contains the POST request information with data path</param>
+    /// <param name="req">Contains the POST request information with book title-URL pairs</param>
     /// <param name="client"></param>
     /// <param name="executionContext"></param>
     /// <returns>Status of orchestration w/ output</returns>
@@ -70,24 +80,52 @@ public static class BookReduce
     {
         ILogger logger = executionContext.GetLogger("BookReduce_HttpStart");
 
-        // TODO: Change to blob storage for prod, for now use .txts locally !!!
-        var path = "C:\\Users\\HamSa\\csClasses\\CS722\\2P_Real\\BookReduce\\BookReduce\\books\\"; // Local path for testing
+        try
+        {
+            // Parse the request body
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var input = JsonSerializer.Deserialize<OrchestrationInput>(requestBody, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
 
-        // Function input comes from the request content.
-        string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
-            nameof(BookReduce), new OrchestrationInput {Path = path});
+            if (input == null || !input.Books.Any())
+            {
+                var badResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                await badResponse.WriteStringAsync("Invalid request. Provide a list of books with title and URL pairs.");
+                return badResponse;
+            }
 
-        logger.LogInformation("Started orchestration with ID = '{instanceId}'.", instanceId);
+            // Validate that all books have both title and URL
+            foreach (var book in input.Books)
+            {
+                if (string.IsNullOrEmpty(book.Title) || string.IsNullOrEmpty(book.Url))
+                {
+                    var badResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                    await badResponse.WriteStringAsync("All books must have both title and URL.");
+                    return badResponse;
+                }
+            }
 
-        // Returns an HTTP 202 response with an instance management payload.
-        // See https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-http-api#start-orchestration
+            string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
+                nameof(BookReduce), input);
 
-        return await client.CreateCheckStatusResponseAsync(req, instanceId);
+            logger.LogInformation("Started orchestration with ID = '{instanceId}' for {bookCount} books.", instanceId, input.Books.Count);
+
+            return await client.CreateCheckStatusResponseAsync(req, instanceId);
+        }
+        catch (JsonException ex)
+        {
+            logger.LogError(ex, "Failed to parse request JSON");
+            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await errorResponse.WriteStringAsync("Invalid JSON format");
+            return errorResponse;
+        }
     }
 
     /// <summary>
-    /// Orchestrates the MapReduce pattern for all the given book paths.
-    /// Calls the mapper function for each file found, then calls the reducer function to aggregate results
+    /// Orchestrates the MapReduce pattern for all the given book URLs.
+    /// Calls the mapper function for each book URL, then calls the reducer function to aggregate results
     /// </summary>
     /// <param name="context"></param>
     /// <returns>Output of where resulting JSON file can be found and a summary of the mapping procedure</returns>
@@ -97,26 +135,24 @@ public static class BookReduce
     {
         ILogger logger = context.CreateReplaySafeLogger(nameof(BookReduce));
 
-        // Get Files to process
+        // Get Books to process
         var input = context.GetInput<OrchestrationInput>();
-        string path = input.Path;
-
-        var files = await context.CallActivityAsync<string[]>
-            (nameof(GetFileListAsync), path);
+        var books = input.Books;
 
         var outputs = new List<string>();
 
-        logger.LogInformation("Files found: {fileCount}", files.Length);
-        logger.LogInformation("Creating mappers to process files...");
-        context.SetCustomStatus($"Files found: {files.Length}. Creating mappers to process files...");
+        logger.LogInformation("Books found: {bookCount}", books.Count);
+        logger.LogInformation("Creating mappers to process books...");
+        context.SetCustomStatus($"Books found: {books.Count}. Creating mappers to process books...");
 
-        // Create mappers to process each file
-        var tasks = new Task<SectionOutput[]>[files.Length];
-        for (int i = 0; i < files.Length; i++)
+        // Create mappers to process each book
+        var tasks = new Task<SectionOutput[]>[books.Count];
+        for (int i = 0; i < books.Count; i++)
         {
+            // Maybe add delay here to avoid overwhelming project Gutenberg?
             tasks[i] = context.CallActivityAsync<SectionOutput[]>(
                 nameof(MapperAsync),
-                files[i]);
+                books[i]);
         }
 
         // Wait for all mapper tasks to complete
@@ -124,7 +160,7 @@ public static class BookReduce
         var flatResults = results.SelectMany(sections => sections).ToArray();
 
         // Reduce mapper results
-        var reducedPath = await context.CallActivityAsync<string>(
+        var reduced = await context.CallActivityAsync<string>(
             nameof(Reducer),
             flatResults);
 
@@ -133,7 +169,7 @@ public static class BookReduce
         {
             outputs.Add($"Book: {section.Book}, Section: {section.Section}, Unique Words: {section.Frequencies.Count}");
         }
-        outputs.Add($"Reduced Results located at: {reducedPath}");
+        outputs.Add(reduced);
 
         return outputs;
     }
@@ -186,7 +222,7 @@ public static class BookReduce
         try
         {
             await File.WriteAllTextAsync(outputPath, jsonContent);
-            return $"Reduced results written to {outputPath}";
+            return jsonContent;
         }
         catch (Exception ex)
         {
@@ -204,35 +240,41 @@ public static class BookReduce
     };
 
     /// <summary>
-    /// Mapper function takes a file path, reads the file, splits into sections, and counts word frequencies in each section.
+    /// Mapper function takes a book input with title and URL, downloads the content, splits into sections, and counts word frequencies in each section.
     /// Creates section objects of 5000 words each which are returned together as an array.
     /// </summary>
     [Function(nameof(MapperAsync))]
     public static async Task<SectionOutput[]> MapperAsync(
-        [ActivityTrigger] string filePath, FunctionContext executionContext)
+        [ActivityTrigger] BookInput bookInput, FunctionContext executionContext)
     {
         ILogger logger = executionContext.GetLogger("MapperAsync");
-        logger.LogInformation("Processing file: {filePath}", filePath);
+        logger.LogInformation("Processing book: {title} from URL: {url}", bookInput.Title, bookInput.Url);
 
-        var sections = Array.Empty<SectionOutput>();
+        var sections = new List<SectionOutput>();
 
         try
         {
-            string content = await File.ReadAllTextAsync(filePath);
+            string content;
+            using (var httpClient = new HttpClient())
+            {
+                // Download content from URL. This is where I got content when testing locally. Keep here?
+                content = await httpClient.GetStringAsync(bookInput.Url);
+            }
 
             var words = content.Split(new char[] { ' ', '\n', '\r', ',', '.', ';', ':', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
 
             var total = 0;
-            
-            var curr = new SectionOutput(Path.GetFileName(filePath), 0);
-            sections.Append(curr);
+            var sectionIndex = 0;
+            var curr = new SectionOutput(bookInput.Title, sectionIndex);
+            sections.Add(curr);
+
             foreach (var word in words)
             {
-                if (total % 5000 == 0) // New section every 5000 words
+                if (total % 5000 == 0 && total > 0) // New section every 5000 words
                 {
-                    Array.Resize(ref sections, sections.Length + 1);
-                    curr = new SectionOutput(Path.GetFileName(filePath), sections.Length - 1);
-                    sections[^1] = curr;
+                    sectionIndex++;
+                    curr = new SectionOutput(bookInput.Title, sectionIndex);
+                    sections.Add(curr);
                 }
 
                 // Skip common words (stop words)
@@ -250,13 +292,15 @@ public static class BookReduce
 
                 total++;
             }
+
+            logger.LogInformation("Processed book '{title}' with {sectionCount} sections", bookInput.Title, sections.Count);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error processing file: {filePath}", filePath);
+            logger.LogError(ex, "Error processing book: {title} from URL: {url}", bookInput.Title, bookInput.Url);
         }
 
-        return sections;
+        return sections.ToArray();
     }
 
     /// <summary>
@@ -265,13 +309,13 @@ public static class BookReduce
     /// <param name="path">Local path to book files</param>
     /// <param name="executionContext"></param>
     /// <returns>.txt files found at path</returns>
-    [Function(nameof(GetFileListAsync))]
-    public static async Task<string[]> GetFileListAsync([ActivityTrigger] string path, FunctionContext executionContext)
-    {
-        ILogger logger = executionContext.GetLogger("GetFileListAsync");
-        logger.LogInformation("Getting file list from path: {path}", path);
-        // For local testing, get .txt files from the specified directory asynchronously
-        var files = await Task.Run(() => Directory.GetFiles(path, "*.txt"));
-        return files;
-    }
+    //[Function(nameof(GetFileListAsync))]
+    //public static async Task<string[]> GetFileListAsync([ActivityTrigger] string path, FunctionContext executionContext)
+    //{
+    //    ILogger logger = executionContext.GetLogger("GetFileListAsync");
+    //    logger.LogInformation("Getting file list from path: {path}", path);
+    //    // For local testing, get .txt files from the specified directory asynchronously
+    //    var files = await Task.Run(() => Directory.GetFiles(path, "*.txt"));
+    //    return files;
+    //}
 }

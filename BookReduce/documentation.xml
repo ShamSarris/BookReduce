@@ -4,11 +4,126 @@
         <name>BookReduce</name>
     </assembly>
     <members>
+        <member name="T:BookReduce.BookReduce">
+            <summary>
+             Map Reduce pattern for counting word frequencies in book sections using Azure Durable Functions.
+            </summary>
+        </member>
+        <member name="T:BookReduce.BookReduce.OrchestrationInput">
+            <summary>
+            Input class for orchestration with book title and URL pairs
+            </summary>
+        </member>
+        <member name="T:BookReduce.BookReduce.BookInput">
+            <summary>
+            Represents a book with its title and URL
+            </summary>
+        </member>
+        <member name="T:BookReduce.BookReduce.SectionOutput">
+            <summary>
+            Output class for mapped books. Each object contains the book name and section of that book. Then a dictionary that maps words in that section to their frequency count.
+            </summary>
+        </member>
+        <member name="T:BookReduce.BookReduce.WordOccurence">
+            <summary>
+            Class to reduce the mapped results into a single word occurrence object. Rather than a section with many words, this class represents a single occurence of a word in a book section (with frequency).
+            </summary>
+        </member>
+        <member name="M:BookReduce.BookReduce.HttpStart(Microsoft.Azure.Functions.Worker.Http.HttpRequestData,Microsoft.DurableTask.Client.DurableTaskClient,Microsoft.Azure.Functions.Worker.FunctionContext)">
+            <summary>
+            Starts a new orchestration instance of the <see cref="T:BookReduce.BookReduce"/> function. Takes HTTP POST requests with book list.
+            </summary>
+            <param name="req">Contains the POST request information with book title-URL pairs</param>
+            <param name="client"></param>
+            <param name="executionContext"></param>
+            <returns>Status of orchestration w/ output</returns>
+        </member>
+        <member name="M:BookReduce.BookReduce.RunOrchestrator(Microsoft.DurableTask.TaskOrchestrationContext)">
+            <summary>
+            Orchestrates the MapReduce pattern for all the given book URLs.
+            Calls the mapper function for each book URL, then calls the reducer function to aggregate results
+            </summary>
+            <param name="context"></param>
+            <returns>Output of where resulting JSON file can be found and a summary of the mapping procedure</returns>
+        </member>
+        <member name="M:BookReduce.BookReduce.Reducer(BookReduce.BookReduce.SectionOutput[],Microsoft.Azure.Functions.Worker.FunctionContext)">
+            <summary>
+            Reduces the outputs of map which has many words per section into a single object per word with all occurrences across sections and books.
+            </summary>
+            <param name="sections">The results from mapping</param>
+            <param name="executionContext"></param>
+            <returns>The path to the resulting JSON file with reduced results</returns>
+        </member>
+        <member name="F:BookReduce.BookReduce.StopWords">
+            <summary>
+            Set of words to ignore when parsing and counting word frequencies.
+            </summary>
+        </member>
+        <member name="M:BookReduce.BookReduce.MapperAsync(BookReduce.BookReduce.BookInput,Microsoft.Azure.Functions.Worker.FunctionContext)">
+            <summary>
+            Mapper function takes a book input with title and URL, downloads the content, splits into sections, and counts word frequencies in each section.
+            Creates section objects of 5000 words each which are returned together as an array.
+            </summary>
+        </member>
         <member name="M:BookReduce.WorkerExtensionStartupCodeExecutor.Configure(Microsoft.Azure.Functions.Worker.IFunctionsWorkerApplicationBuilder)">
             <summary>
             Configures the worker to register extension startup services.
             </summary>
             <param name="applicationBuilder">The <see cref="T:Microsoft.Azure.Functions.Worker.IFunctionsWorkerApplicationBuilder"/> to configure.</param>
+        </member>
+        <member name="M:BookReduce.DirectFunctionExecutor.ExecuteAsync(Microsoft.Azure.Functions.Worker.FunctionContext)">
+            <inheritdoc/>
+        </member>
+        <member name="T:BookReduce.FunctionExecutorHostBuilderExtensions">
+            <summary>
+            Extension methods to enable registration of the custom <see cref="T:Microsoft.Azure.Functions.Worker.Invocation.IFunctionExecutor"/> implementation generated for the current worker.
+            </summary>
+        </member>
+        <member name="M:BookReduce.FunctionExecutorHostBuilderExtensions.ConfigureGeneratedFunctionExecutor(Microsoft.Extensions.Hosting.IHostBuilder)">
+            <summary>
+             Configures an optimized function executor to the invocation pipeline.
+            </summary>
+        </member>
+        <member name="T:BookReduce.FunctionExecutorAutoStartup">
+            <summary>
+            Auto startup class to register the custom <see cref="T:Microsoft.Azure.Functions.Worker.Invocation.IFunctionExecutor"/> implementation generated for the current worker.
+            </summary>
+        </member>
+        <member name="M:BookReduce.FunctionExecutorAutoStartup.Configure(Microsoft.Extensions.Hosting.IHostBuilder)">
+            <summary>
+            Configures the <see cref="T:Microsoft.Extensions.Hosting.IHostBuilder"/> to use the custom <see cref="T:Microsoft.Azure.Functions.Worker.Invocation.IFunctionExecutor"/> implementation generated for the current worker.
+            </summary>
+            <param name="hostBuilder">The <see cref="T:Microsoft.Extensions.Hosting.IHostBuilder"/> instance to use for service registration.</param>
+        </member>
+        <member name="T:BookReduce.GeneratedFunctionMetadataProvider">
+            <summary>
+            Custom <see cref="T:Microsoft.Azure.Functions.Worker.Core.FunctionMetadata.IFunctionMetadataProvider"/> implementation that returns function metadata definitions for the current worker.
+            </summary>
+        </member>
+        <member name="M:BookReduce.GeneratedFunctionMetadataProvider.GetFunctionMetadataAsync(System.String)">
+            <inheritdoc/>
+        </member>
+        <member name="T:BookReduce.WorkerHostBuilderFunctionMetadataProviderExtension">
+            <summary>
+            Extension methods to enable registration of the custom <see cref="T:Microsoft.Azure.Functions.Worker.Core.FunctionMetadata.IFunctionMetadataProvider"/> implementation generated for the current worker.
+            </summary>
+        </member>
+        <member name="M:BookReduce.WorkerHostBuilderFunctionMetadataProviderExtension.ConfigureGeneratedFunctionMetadataProvider(Microsoft.Extensions.Hosting.IHostBuilder)">
+            <summary>
+             Adds the GeneratedFunctionMetadataProvider to the service collection.
+             During initialization, the worker will return generated function metadata instead of relying on the Azure Functions host for function indexing.
+            </summary>
+        </member>
+        <member name="T:BookReduce.FunctionMetadataProviderAutoStartup">
+            <summary>
+            Auto startup class to register the custom <see cref="T:Microsoft.Azure.Functions.Worker.Core.FunctionMetadata.IFunctionMetadataProvider"/> implementation generated for the current worker.
+            </summary>
+        </member>
+        <member name="M:BookReduce.FunctionMetadataProviderAutoStartup.Configure(Microsoft.Extensions.Hosting.IHostBuilder)">
+            <summary>
+            Configures the <see cref="T:Microsoft.Extensions.Hosting.IHostBuilder"/> to use the custom <see cref="T:Microsoft.Azure.Functions.Worker.Core.FunctionMetadata.IFunctionMetadataProvider"/> implementation generated for the current worker.
+            </summary>
+            <param name="hostBuilder">The <see cref="T:Microsoft.Extensions.Hosting.IHostBuilder"/> instance to use for service registration.</param>
         </member>
     </members>
 </doc>
