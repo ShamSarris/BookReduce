@@ -1,5 +1,4 @@
 using System.Net;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Azure.Functions.Worker;
@@ -7,7 +6,6 @@ using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.DurableTask;
 using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
-using Azure.Storage.Blobs;
 
 namespace BookReduce;
 
@@ -27,19 +25,23 @@ public class BookReduceFunctions
 
     public class BookInput
     {
+        public int Id { get; set; } // <--- ADDED THIS
         public string Name { get; set; } = string.Empty;
         public string Url { get; set; } = string.Empty;
     }
 
     public class BucketOutput 
     {
+        public int BookId { get; set; } // <--- ADDED THIS
         public string BookName { get; set; } = string.Empty;
         public int BucketNumber { get; set; } 
         public Dictionary<string, int> Frequencies { get; set; }
 
-        public BucketOutput(string bookName, int bucketNumber)
+        // Updated Constructor to accept BookId
+        public BucketOutput(int bookId, string bookName, int bucketNumber)
         {
             Frequencies = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            BookId = bookId; // <--- ASSIGN THIS
             BookName = bookName;
             BucketNumber = bucketNumber;
         }
@@ -47,6 +49,7 @@ public class BookReduceFunctions
 
     public class TermOccurrence
     {
+        public int BookId { get; set; } // <--- ADDED THIS
         public string BookName { get; set; } = string.Empty;
         public int BucketNumber { get; set; }
         public int TermFrequency { get; set; }
@@ -98,6 +101,12 @@ public class BookReduceFunctions
             };
         }
 
+        // ASSIGN IDs HERE so they aren't 0
+        for (int i = 0; i < input.Books.Count; i++)
+        {
+            input.Books[i].Id = i + 1;
+        }
+
         string instanceId = await client.ScheduleNewOrchestrationInstanceAsync(
             "BookReduce", input);
 
@@ -118,7 +127,6 @@ public class BookReduceFunctions
         logger.LogInformation("Starting MapReduce for {bookCount} books", input!.Books.Count);
         context.SetCustomStatus($"Starting MapReduce for {input.Books.Count} books...");
 
-        // MAP PHASE: Fan-out
         var mapTasks = new List<Task<BucketOutput[]>>();
         foreach (var book in input.Books)
         {
@@ -136,7 +144,6 @@ public class BookReduceFunctions
         logger.LogInformation("Map complete: {bucketCount} buckets generated", allBuckets.Length);
         context.SetCustomStatus($"Map complete. Reducing {allBuckets.Length} buckets...");
 
-        // REDUCE & SAVE PHASE - Combined to avoid passing huge data between activities
         var result = await context.CallActivityAsync<SaveIndexResult>(
             "ReduceAndSaveWorker",
             allBuckets);
@@ -160,7 +167,6 @@ public class BookReduceFunctions
             httpClient.Timeout = TimeSpan.FromMinutes(2);
             string content = await httpClient.GetStringAsync(bookInput.Url);
 
-            // Remove punctuation
             string cleanedContent = Regex.Replace(content, @"[^\w\s]", " ");
             
             var words = cleanedContent
@@ -173,7 +179,9 @@ public class BookReduceFunctions
 
             const int BUCKET_SIZE = 5000;
             int bucketNumber = 1;
-            BucketOutput currentBucket = new BucketOutput(bookInput.Name, bucketNumber);
+            
+            // Pass the ID to the constructor
+            BucketOutput currentBucket = new BucketOutput(bookInput.Id, bookInput.Name, bucketNumber);
             int wordCount = 0;
 
             foreach (var word in words)
@@ -196,7 +204,7 @@ public class BookReduceFunctions
                 {
                     buckets.Add(currentBucket);
                     bucketNumber++;
-                    currentBucket = new BucketOutput(bookInput.Name, bucketNumber);
+                    currentBucket = new BucketOutput(bookInput.Id, bookInput.Name, bucketNumber);
                 }
             }
 
@@ -223,17 +231,7 @@ public class BookReduceFunctions
 
         try
         {
-            string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage") 
-                ?? throw new Exception("AzureWebJobsStorage not configured");
-            
-            var blobServiceClient = new BlobServiceClient(connectionString);
-            var containerClient = blobServiceClient.GetBlobContainerClient("mapreduce-output");
-            await containerClient.CreateIfNotExistsAsync();
-            
-            string blobName = $"inverted_index_{DateTime.UtcNow:yyyyMMdd_HHmmss}.json";
-            var blobClient = containerClient.GetBlobClient(blobName);
-
-            // Build inverted index
+            // 1. BUILD THE INVERTED INDEX (Logic unchanged)
             var invertedIndex = new Dictionary<string, List<TermOccurrence>>(StringComparer.OrdinalIgnoreCase);
             
             foreach (var bucket in buckets)
@@ -250,6 +248,7 @@ public class BookReduceFunctions
 
                     invertedIndex[term].Add(new TermOccurrence
                     {
+                        BookId = bucket.BookId,
                         BookName = bucket.BookName,
                         BucketNumber = bucket.BucketNumber,
                         TermFrequency = frequency
@@ -257,70 +256,65 @@ public class BookReduceFunctions
                 }
             }
 
-            // Sort each term's occurrences
+            // 2. SORT (Logic unchanged)
             foreach (var term in invertedIndex.Keys.ToList())
             {
                 invertedIndex[term] = invertedIndex[term]
                     .OrderByDescending(occ => occ.TermFrequency)
-                    .ThenBy(occ => occ.BookName)
-                    .ThenBy(occ => occ.BucketNumber)
                     .ToList();
             }
 
-            _logger.LogInformation("REDUCE: Index with {termCount} terms created", invertedIndex.Count);
+            // 3. PREPARE LOCAL FILE PATH (Modified to use the current execution directory)
+            
+            // Get the directory where the Azure Function host (func.exe) is running.
+            string baseDirectory = Directory.GetCurrentDirectory(); 
+            
+            // Create a subfolder called 'output' or 'results' inside the project folder
+            string folderPath = Path.Combine(baseDirectory, "MapReduceOutput");
+            
+            if (!Directory.Exists(folderPath))
+            {
+                Directory.CreateDirectory(folderPath);
+            }
 
-            // Calculate statistics
+            string fileName = $"inverted_index_{DateTime.Now:yyyyMMdd_HHmmss}.json";
+            string fullPath = Path.Combine(folderPath, fileName);
+
+            // 4. STREAM JSON TO LOCAL FILE (Logic unchanged)
             int totalTerms = invertedIndex.Count;
             int totalOccurrences = invertedIndex.Values.Sum(list => list.Count);
-            var topTerms = invertedIndex
-                .Select(kvp => new { 
-                    Term = kvp.Key, 
-                    TotalFreq = kvp.Value.Sum(o => o.TermFrequency)
-                })
-                .OrderByDescending(x => x.TotalFreq)
-                .Take(10)
-                .ToList();
 
-            // Stream JSON directly to blob to avoid memory issues
-            using var stream = new MemoryStream();
-            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
-
-            writer.WriteStartObject();
-            foreach (var kvp in invertedIndex.OrderBy(x => x.Key))
+            using (var fileStream = new FileStream(fullPath, FileMode.Create, FileAccess.Write))
+            using (var writer = new Utf8JsonWriter(fileStream, new JsonWriterOptions { Indented = true }))
             {
-                writer.WritePropertyName(kvp.Key);
-                writer.WriteStartArray();
-                foreach (var occ in kvp.Value)
+                writer.WriteStartObject();
+                foreach (var kvp in invertedIndex.OrderBy(x => x.Key))
                 {
-                    writer.WriteStartObject();
-                    writer.WriteString("bookName", occ.BookName);
-                    writer.WriteNumber("bucketNumber", occ.BucketNumber);
-                    writer.WriteNumber("termFrequency", occ.TermFrequency);
-                    writer.WriteEndObject();
+                    writer.WritePropertyName(kvp.Key);
+                    writer.WriteStartArray();
+                    foreach (var occ in kvp.Value)
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteNumber("bookId", occ.BookId); 
+                        writer.WriteString("bookName", occ.BookName); 
+                        writer.WriteNumber("bucketNumber", occ.BucketNumber);
+                        writer.WriteNumber("termFrequency", occ.TermFrequency);
+                        writer.WriteEndObject();
+                    }
+                    writer.WriteEndArray();
                 }
-                writer.WriteEndArray();
+                writer.WriteEndObject();
             }
-            writer.WriteEndObject();
-            await writer.FlushAsync();
 
-            // Upload to blob
-            stream.Position = 0;
-            await blobClient.UploadAsync(stream, overwrite: true);
-
-            _logger.LogInformation("=== INDEX STATISTICS ===");
+            // 5. LOGGING AND RETURN
+            _logger.LogInformation("=== MAPREDUCE COMPLETE ===");
             _logger.LogInformation("Total terms: {terms}", totalTerms);
             _logger.LogInformation("Total occurrences: {occ}", totalOccurrences);
-            _logger.LogInformation("Top 10 terms:");
-            foreach (var t in topTerms)
-            {
-                _logger.LogInformation("  {term}: {freq}", t.Term, t.TotalFreq);
-            }
-            _logger.LogInformation("Saved to blob: {blobName}", blobName);
-            _logger.LogInformation("Download from: Azure Portal → bookreducestorage → mapreduce-output → {blobName}", blobName);
+            _logger.LogInformation("FILE SAVED LOCALLY AT: {path}", fullPath);
 
             return new SaveIndexResult
             {
-                BlobName = blobName,
+                BlobName = fullPath,
                 TermCount = totalTerms,
                 TotalOccurrences = totalOccurrences
             };
